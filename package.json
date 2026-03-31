@@ -1,0 +1,10 @@
+{
+	"name": "pi-mini-web-research",
+	"version": "1.0.0",
+	"description": "Web research tools for pi — search the web, fetch pages, and query GitHub with no dependencies",
+	"keywords": ["pi-package"],
+	"license": "MIT",
+	"pi": {
+		"extensions": ["./extensions"]
+	}
+}
