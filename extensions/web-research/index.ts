@@ -74,7 +74,9 @@ function saveCache(cache: CacheStore): void {
 	}
 
 	fs.mkdirSync(CACHE_DIR, { recursive: true });
-	fs.writeFileSync(CACHE_FILE, JSON.stringify(cache));
+	const tmp = CACHE_FILE + ".tmp";
+	fs.writeFileSync(tmp, JSON.stringify(cache));
+	fs.renameSync(tmp, CACHE_FILE);
 }
 
 function getCached(url: string): CacheEntry | null {
@@ -112,7 +114,7 @@ export default function (pi: ExtensionAPI) {
 			"Prefer specific, targeted queries over broad ones for better results.",
 		],
 		parameters: Type.Object({
-			query: Type.String({ description: "Search query" }),
+			query: Type.String({ description: "Search query", maxLength: 500 }),
 		}),
 
 		async execute(_toolCallId, params, signal) {
@@ -268,7 +270,7 @@ export default function (pi: ExtensionAPI) {
 				["search_repos", "search_code", "search_issues", "read_file", "list_tree"] as const,
 				{ description: "Action to perform" },
 			),
-			query: Type.Optional(Type.String({ description: "Search query (for search_* actions)" })),
+			query: Type.Optional(Type.String({ description: "Search query (for search_* actions)", maxLength: 500 })),
 			owner: Type.Optional(Type.String({ description: "Repo owner (for read_file, list_tree)" })),
 			repo: Type.Optional(Type.String({ description: "Repo name (for read_file, list_tree)" })),
 			path: Type.Optional(
@@ -401,6 +403,8 @@ export default function (pi: ExtensionAPI) {
 				case "read_file": {
 					if (!params.owner || !params.repo) throw new Error("owner and repo are required for read_file");
 					if (!params.path) throw new Error("path is required for read_file");
+					if (params.path.includes("..") || params.path.startsWith("/"))
+						throw new Error("Invalid path: must not contain '..' or start with '/'");
 
 					const ref = params.branch ? `?ref=${encodeURIComponent(params.branch)}` : "";
 					const endpoint = `repos/${params.owner}/${params.repo}/contents/${params.path}${ref}`;
@@ -434,6 +438,8 @@ export default function (pi: ExtensionAPI) {
 				case "list_tree": {
 					if (!params.owner || !params.repo)
 						throw new Error("owner and repo are required for list_tree");
+					if (params.path && (params.path.includes("..") || params.path.startsWith("/")))
+						throw new Error("Invalid path: must not contain '..' or start with '/'");
 
 					const branch = params.branch || "HEAD";
 					const endpoint = `repos/${params.owner}/${params.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`;

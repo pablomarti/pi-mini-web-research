@@ -41,6 +41,10 @@ def _ssl_context():
             if os.path.isfile(ca_path):
                 ctx.load_verify_locations(ca_path)
                 break
+        if not ctx.get_ca_certs():
+            raise ssl.SSLError(
+                "No CA certificates found. Run: pip install certifi, or set SSL_CERT_FILE."
+            )
     return ctx
 
 
@@ -191,12 +195,16 @@ def cmd_search(query: str):
 
 def cmd_fetch(url: str):
     """Fetch a URL, clean HTML, print JSON with text content."""
+    parsed_url = urllib.parse.urlparse(url)
+    if parsed_url.scheme not in ("http", "https"):
+        json.dump({"error": f"Only HTTP(S) URLs are supported, got: {parsed_url.scheme!r}"}, sys.stdout)
+        return
     try:
         resp = _request(url)
         raw = resp.read(MAX_DOWNLOAD)
         content_type = resp.headers.get("Content-Type", "")
-        final_url = resp.url if hasattr(resp, "url") else url
-    except Exception as exc:
+        final_url = resp.geturl()
+    except (urllib.error.URLError, OSError) as exc:
         json.dump({"error": str(exc), "url": url}, sys.stdout)
         return
 
