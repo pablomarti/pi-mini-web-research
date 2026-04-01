@@ -26,10 +26,15 @@ const PYTHON_SCRIPT = path.join(EXTENSION_DIR, "research.py");
 
 const CACHE_DIR = path.join(os.homedir(), ".pi", "agent");
 const CACHE_FILE = path.join(CACHE_DIR, "web-research-cache.json");
+const CACHE_LOCK_FILE = path.join(CACHE_DIR, "web-research-cache.lock");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_CACHE_ENTRIES = 200;
+const CACHE_LOCK_TIMEOUT_MS = 2_000;
+const CACHE_LOCK_RETRY_MS = 25;
 
 const DEFAULT_CHUNK = 12_000; // chars sent to LLM per fetch call
+const MAX_CHUNK = 20_000;
+const MAX_OFFSET = 5_000_000;
 const MAX_TREE_ENTRIES = 500;
 
 // ---------------------------------------------------------------------------
@@ -90,6 +95,41 @@ function putCache(entry: CacheEntry): void {
 	const cache = loadCache();
 	cache[entry.url] = entry;
 	saveCache(cache);
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withCacheLock<T>(fn: () => T): Promise<T> {
+	fs.mkdirSync(CACHE_DIR, { recursive: true });
+	const deadline = Date.now() + CACHE_LOCK_TIMEOUT_MS;
+
+	while (true) {
+		let handle: fs.promises.FileHandle | undefined;
+		try {
+			handle = await fs.promises.open(CACHE_LOCK_FILE, "wx");
+			try {
+				return fn();
+			} finally {
+				await handle.close();
+				await fs.promises.unlink(CACHE_LOCK_FILE).catch(() => undefined);
+			}
+		} catch (error) {
+			const errno = error as NodeJS.ErrnoException;
+			if (errno.code !== "EEXIST") throw error;
+			if (Date.now() > deadline) {
+				throw new Error("Timed out waiting for cache lock");
+			}
+			await sleep(CACHE_LOCK_RETRY_MS);
+		}
+	}
+}
+
+async function putCacheAsync(entry: CacheEntry): Promise<void> {
+	await withCacheLock(() => {
+		putCache(entry);
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -177,8 +217,16 @@ export default function (pi: ExtensionAPI) {
 			const offset = params.offset ?? 0;
 			const limit = params.limit ?? DEFAULT_CHUNK;
 
+			if (!Number.isInteger(offset) || offset < 0 || offset > MAX_OFFSET) {
+				throw new Error(`offset must be an integer between 0 and ${MAX_OFFSET}`);
+			}
+			if (!Number.isInteger(limit) || limit < 1 || limit > MAX_CHUNK) {
+				throw new Error(`limit must be an integer between 1 and ${MAX_CHUNK}`);
+			}
+
 			// Try cache first
 			let entry = getCached(params.url);
+			let cached = Boolean(entry);
 
 			if (!entry) {
 				const result = await pi.exec("python3", [PYTHON_SCRIPT, "fetch", params.url], {
@@ -215,7 +263,8 @@ export default function (pi: ExtensionAPI) {
 					contentType: parsed.contentType,
 				};
 
-				putCache(entry);
+				await putCacheAsync(entry);
+				cached = false;
 			}
 
 			const chunk = entry.content.slice(offset, offset + limit);
@@ -243,7 +292,7 @@ export default function (pi: ExtensionAPI) {
 					offset,
 					chunkSize: chunk.length,
 					hasMore,
-					cached: true,
+					cached,
 				},
 			};
 		},

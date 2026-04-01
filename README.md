@@ -59,9 +59,26 @@ Uses the `gh` CLI for structured, token-efficient GitHub access:
 ## Security
 
 - **Zero npm dependencies** — only Python3 stdlib and `gh` CLI
+- **Strict network policy by default** — `web_fetch` blocks localhost, private/link-local networks, and known cloud metadata endpoints
+- **Explicit allowlist escape hatch** — set `PI_WEB_RESEARCH_ALLOWLIST` for trusted internal hosts or CIDR ranges
 - **No API keys stored** — DuckDuckGo needs none; `gh` uses your existing authentication
 - **Local cache only** — nothing leaves your machine except the HTTP requests you'd make manually
 - **No telemetry** — no tracking, no analytics, no phone-home
+
+### Internal Host Allowlist
+
+`web_fetch` is locked down to public network targets unless allowlisted.
+
+```bash
+# Allow a trusted internal host and subnet
+export PI_WEB_RESEARCH_ALLOWLIST="docs.corp.example,10.0.0.0/8"
+```
+
+Allowlist entries can be:
+
+- hostnames (exact match or subdomains)
+- IP addresses
+- CIDR ranges
 
 ## Cache
 

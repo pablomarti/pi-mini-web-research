@@ -9,8 +9,10 @@ Commands:
 """
 
 import json
+import ipaddress
 import os
 import re
+import socket
 import ssl
 import sys
 import urllib.error
@@ -26,6 +28,26 @@ USER_AGENT = (
 TIMEOUT = 20
 MAX_DOWNLOAD = 1024 * 1024  # 1 MB
 
+ALLOWLIST_ENV = "PI_WEB_RESEARCH_ALLOWLIST"
+
+BLOCKED_HOSTNAMES = {
+    "localhost",
+    "localhost.localdomain",
+    "metadata.google.internal",
+    "metadata",
+    "instance-data",
+    "169.254.169.254",
+    "100.100.100.200",  # Alibaba Cloud metadata
+}
+
+BLOCKED_HOST_SUFFIXES = (
+    ".localhost",
+    ".localdomain",
+    ".local",
+    ".internal",
+    ".home.arpa",
+)
+
 
 def _ssl_context():
     """Create SSL context, working around macOS Python missing certs."""
@@ -33,10 +55,10 @@ def _ssl_context():
     # macOS framework Python often lacks root certs. Try system CA bundle.
     if not ctx.get_ca_certs():
         for ca_path in [
-            "/etc/ssl/cert.pem",                        # macOS system
-            "/etc/ssl/certs/ca-certificates.crt",        # Debian/Ubuntu
-            "/etc/pki/tls/certs/ca-bundle.crt",          # RHEL/Fedora
-            "/opt/homebrew/etc/openssl@3/cert.pem",      # Homebrew
+            "/etc/ssl/cert.pem",  # macOS system
+            "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu
+            "/etc/pki/tls/certs/ca-bundle.crt",  # RHEL/Fedora
+            "/opt/homebrew/etc/openssl@3/cert.pem",  # Homebrew
         ]:
             if os.path.isfile(ca_path):
                 ctx.load_verify_locations(ca_path)
@@ -48,8 +70,126 @@ def _ssl_context():
     return ctx
 
 
+def _parse_allowlist():
+    """Parse PI_WEB_RESEARCH_ALLOWLIST into allowed hosts and networks."""
+    raw = os.environ.get(ALLOWLIST_ENV, "")
+    hosts = set()
+    networks = []
+
+    for item in raw.split(","):
+        token = item.strip().lower()
+        if not token:
+            continue
+
+        try:
+            if "/" in token:
+                networks.append(ipaddress.ip_network(token, strict=False))
+                continue
+
+            ip = ipaddress.ip_address(token)
+            prefix = 32 if ip.version == 4 else 128
+            networks.append(ipaddress.ip_network(f"{token}/{prefix}", strict=False))
+            continue
+        except ValueError:
+            hosts.add(token)
+
+    return hosts, networks
+
+
+def _host_is_allowlisted(hostname: str, allowed_hosts: set[str]) -> bool:
+    host = hostname.lower().rstrip(".")
+    if host in allowed_hosts:
+        return True
+
+    for allowed in allowed_hosts:
+        if host.endswith(f".{allowed}"):
+            return True
+
+    return False
+
+
+def _ip_is_allowlisted(ip: ipaddress._BaseAddress, allowed_networks) -> bool:
+    return any(ip in network for network in allowed_networks)
+
+
+def _is_blocked_hostname(hostname: str) -> bool:
+    host = hostname.lower().rstrip(".")
+    if host in BLOCKED_HOSTNAMES:
+        return True
+    return any(host.endswith(suffix) for suffix in BLOCKED_HOST_SUFFIXES)
+
+
+def _is_blocked_ip(ip: ipaddress._BaseAddress) -> bool:
+    # Strict-by-default: only globally routable addresses are allowed.
+    return not ip.is_global
+
+
+def _resolve_ips_for_host(hostname: str):
+    host = hostname.lower().rstrip(".")
+    try:
+        parsed = ipaddress.ip_address(host)
+        return [parsed]
+    except ValueError:
+        pass
+
+    results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    ips = []
+    seen = set()
+    for result in results:
+        value = result[4][0]
+        if "%" in value:
+            value = value.split("%", 1)[0]
+        ip = ipaddress.ip_address(value)
+        key = str(ip)
+        if key not in seen:
+            seen.add(key)
+            ips.append(ip)
+
+    if not ips:
+        raise ValueError(f"Could not resolve host: {hostname}")
+
+    return ips
+
+
+def _validate_target_url(url: str):
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Only HTTP(S) URLs are supported, got: {parsed.scheme!r}")
+    if not parsed.hostname:
+        raise ValueError("URL must include a hostname")
+    if parsed.username or parsed.password:
+        raise ValueError("URLs with embedded credentials are not allowed")
+
+    hostname = parsed.hostname.lower().rstrip(".")
+    allowed_hosts, allowed_networks = _parse_allowlist()
+
+    host_allowlisted = _host_is_allowlisted(hostname, allowed_hosts)
+    if _is_blocked_hostname(hostname) and not host_allowlisted:
+        raise ValueError(
+            "Target host is blocked by default network policy. "
+            f"Use {ALLOWLIST_ENV} to allowlist trusted internal hosts."
+        )
+
+    for ip in _resolve_ips_for_host(hostname):
+        if _is_blocked_ip(ip) and not (
+            host_allowlisted or _ip_is_allowlisted(ip, allowed_networks)
+        ):
+            raise ValueError(
+                "Target resolves to a blocked IP address. "
+                f"Use {ALLOWLIST_ENV} to allowlist trusted internal ranges."
+            )
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_target_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _request(url, data=None, headers=None, method=None):
     """Build and execute a urllib request."""
+    _validate_target_url(url)
+
     hdrs = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -58,23 +198,51 @@ def _request(url, data=None, headers=None, method=None):
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-    return urllib.request.urlopen(req, timeout=TIMEOUT, context=_ssl_context())
+    opener = urllib.request.build_opener(
+        _SafeRedirectHandler(),
+        urllib.request.HTTPSHandler(context=_ssl_context()),
+    )
+    opener.addheaders = []
+    return opener.open(req, timeout=TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
 # HTML → plain text
 # ---------------------------------------------------------------------------
 
+
 class _TextExtractor(HTMLParser):
     """Extract readable text from HTML, skipping scripts/styles/nav."""
 
     _SKIP = frozenset({"script", "style", "noscript", "svg", "path", "nav"})
-    _BLOCK = frozenset({
-        "p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
-        "li", "tr", "br", "hr", "blockquote", "pre",
-        "article", "section", "header", "footer", "table",
-        "thead", "tbody", "dt", "dd", "figcaption",
-    })
+    _BLOCK = frozenset(
+        {
+            "p",
+            "div",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "li",
+            "tr",
+            "br",
+            "hr",
+            "blockquote",
+            "pre",
+            "article",
+            "section",
+            "header",
+            "footer",
+            "table",
+            "thead",
+            "tbody",
+            "dt",
+            "dd",
+            "figcaption",
+        }
+    )
 
     def __init__(self):
         super().__init__()
@@ -123,6 +291,7 @@ class _TextExtractor(HTMLParser):
 # DuckDuckGo Lite parser
 # ---------------------------------------------------------------------------
 
+
 class _DDGParser(HTMLParser):
     """Parse DuckDuckGo Lite result rows."""
 
@@ -168,6 +337,7 @@ class _DDGParser(HTMLParser):
 # Commands
 # ---------------------------------------------------------------------------
 
+
 def cmd_search(query: str):
     """Search DuckDuckGo Lite and print JSON results."""
     body = urllib.parse.urlencode({"q": query}).encode()
@@ -195,16 +365,16 @@ def cmd_search(query: str):
 
 def cmd_fetch(url: str):
     """Fetch a URL, clean HTML, print JSON with text content."""
-    parsed_url = urllib.parse.urlparse(url)
-    if parsed_url.scheme not in ("http", "https"):
-        json.dump({"error": f"Only HTTP(S) URLs are supported, got: {parsed_url.scheme!r}"}, sys.stdout)
-        return
     try:
         resp = _request(url)
         raw = resp.read(MAX_DOWNLOAD)
         content_type = resp.headers.get("Content-Type", "")
         final_url = resp.geturl()
+        _validate_target_url(final_url)
     except (urllib.error.URLError, OSError) as exc:
+        json.dump({"error": str(exc), "url": url}, sys.stdout)
+        return
+    except ValueError as exc:
         json.dump({"error": str(exc), "url": url}, sys.stdout)
         return
 
@@ -215,9 +385,8 @@ def cmd_fetch(url: str):
 
     text = raw.decode(encoding, errors="replace")
 
-    is_html = (
-        "html" in content_type.lower()
-        or text.strip()[:200].lower().startswith(("<!doctype", "<html"))
+    is_html = "html" in content_type.lower() or text.strip()[:200].lower().startswith(
+        ("<!doctype", "<html")
     )
 
     if is_html:
