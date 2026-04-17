@@ -5,6 +5,12 @@
 	"keywords": ["pi-package"],
 	"license": "MIT",
 	"pi": {
-		"extensions": ["./extensions"]
+		"extensions": ["./extensions"],
+		"env": {
+			"TAVILY_API_KEY": {
+				"description": "Optional Tavily API key. When set, web_search uses Tavily instead of DuckDuckGo Lite. Get a key at https://app.tavily.com",
+				"required": false
+			}
+		}
 	}
 }
