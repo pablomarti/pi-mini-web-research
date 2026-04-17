@@ -4,7 +4,9 @@ Web research helper for pi-mini-web-research.
 Python3 stdlib only — no pip packages required.
 
 Commands:
-    search <query>   Search DuckDuckGo Lite, return JSON results
+    search <query>   Search the web, return JSON results
+                     Uses Tavily when TAVILY_API_KEY is set,
+                     otherwise falls back to DuckDuckGo Lite.
     fetch  <url>     Fetch URL, strip HTML, return cleaned text as JSON
 """
 
@@ -334,6 +336,49 @@ class _DDGParser(HTMLParser):
 
 
 # ---------------------------------------------------------------------------
+# Tavily Search API (used when TAVILY_API_KEY is set)
+# ---------------------------------------------------------------------------
+
+
+def cmd_search_tavily(query: str):
+    """Search via Tavily REST API and print JSON results."""
+    api_key = os.environ.get("TAVILY_API_KEY", "")
+    payload = json.dumps({
+        "query": query[:400],
+        "max_results": 20,
+        "search_depth": "basic",
+        "topic": "general",
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.tavily.com/search",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    ctx = _ssl_context()
+    resp = urllib.request.urlopen(req, timeout=TIMEOUT, context=ctx)
+    body = json.loads(resp.read().decode("utf-8", errors="replace"))
+
+    results = []
+    for r in body.get("results", []):
+        results.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "snippet": r.get("content", ""),
+        })
+
+    json.dump(
+        {"results": results[:20], "provider": "tavily"},
+        sys.stdout,
+        ensure_ascii=False,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -429,7 +474,11 @@ if __name__ == "__main__":
             if len(sys.argv) < 3:
                 json.dump({"error": "Missing search query"}, sys.stdout)
                 sys.exit(1)
-            cmd_search(" ".join(sys.argv[2:]))
+            query = " ".join(sys.argv[2:])
+            if os.environ.get("TAVILY_API_KEY"):
+                cmd_search_tavily(query)
+            else:
+                cmd_search(query)
         elif cmd == "fetch":
             if len(sys.argv) < 3:
                 json.dump({"error": "Missing URL"}, sys.stdout)

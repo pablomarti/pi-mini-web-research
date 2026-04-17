@@ -145,9 +145,10 @@ export default function (pi: ExtensionAPI) {
 		name: "web_search",
 		label: "Web Search",
 		description:
-			"Search the web using DuckDuckGo. Returns ranked results with title, URL, and snippet. " +
+			"Search the web using Tavily (when TAVILY_API_KEY is configured) or DuckDuckGo as fallback. " +
+			"Returns ranked results with title, URL, and snippet. " +
 			"Use web_fetch on promising URLs to read full content.",
-		promptSnippet: "Search the web via DuckDuckGo for articles, docs, papers, and references",
+		promptSnippet: "Search the web via Tavily (or DuckDuckGo fallback) for articles, docs, papers, and references",
 		promptGuidelines: [
 			"Use web_search to find relevant articles, documentation, papers, and references when you need external knowledge.",
 			"After searching, pick the most promising URLs and use web_fetch to read their full content.",
@@ -167,7 +168,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`Search failed: ${result.stderr || "unknown error"}`);
 			}
 
-			let parsed: { results?: Array<{ title: string; url: string; snippet: string }>; error?: string };
+			let parsed: { results?: Array<{ title: string; url: string; snippet: string }>; error?: string; provider?: string };
 			try {
 				parsed = JSON.parse(result.stdout);
 			} catch {
@@ -177,13 +178,14 @@ export default function (pi: ExtensionAPI) {
 			if (parsed.error) throw new Error(`Search error: ${parsed.error}`);
 
 			const results = parsed.results ?? [];
+			const provider = parsed.provider ?? "duckduckgo";
 			const formatted = results
 				.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`)
 				.join("\n\n");
 
 			return {
 				content: [{ type: "text", text: formatted || "No results found." }],
-				details: { query: params.query, resultCount: results.length, results },
+				details: { query: params.query, resultCount: results.length, provider, results },
 			};
 		},
 	});
