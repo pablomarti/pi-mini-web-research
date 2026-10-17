@@ -6,7 +6,7 @@ Web research tools for [pi](https://github.com/badlogic/pi-mono). Gives the agen
 
 | Tool | Description |
 |------|-------------|
-| `web_search` | Search the web via DuckDuckGo Lite. Returns ranked results with title, snippet, and URL. |
+| `web_search` | Search the web via DuckDuckGo Lite or opt-in Parallel Search MCP. Returns ranked results with title, snippet, and URL. |
 | `web_fetch` | Fetch a URL and return cleaned plain text (HTML tags stripped). Supports pagination via offset/limit for large pages. Results cached 24h. |
 | `github` | Search GitHub repos/code/issues, read files, and list repo trees via the `gh` CLI. |
 
@@ -35,6 +35,25 @@ pi -e /path/to/pi-mini-web-research/extensions/web-research
 ### web_search
 
 Queries DuckDuckGo Lite (`lite.duckduckgo.com/lite`) via a Python3 script using only `urllib` and `html.parser`. No API keys needed. Returns up to 20 results with title, URL, and snippet.
+
+To use [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+instead, set the provider before starting pi:
+
+```bash
+PI_WEB_RESEARCH_SEARCH_PROVIDER=parallel pi
+```
+
+Parallel supplies search excerpts through its anonymous HTTP MCP endpoint
+(`https://search.parallel.ai/mcp`), using Fast mode with no account, API key,
+or additional dependencies. Queries are sent to Parallel only when selected.
+Anonymous access has service rate limits; errors are reported to the agent
+without switching providers. Search retains pi's cancellation and 25-second
+process timeout. `web_fetch` continues to fetch pages directly with the existing
+network policy and cache.
+
+Leave `PI_WEB_RESEARCH_SEARCH_PROVIDER` unset, or set it to `duckduckgo`, to keep
+DuckDuckGo Lite. Set it to `none` to disable search requests. Unknown values
+produce an error. These settings do not enable a tool disabled in pi.
 
 ### web_fetch
 
@@ -105,6 +124,20 @@ Find recent papers about transformer architecture improvements
 ```
 
 The agent will use `web_search` → `web_fetch` and/or `github` tools autonomously.
+
+## Development
+
+Run the Python tests with `python3 -m unittest discover -s tests -v`.
+The extension integration test uses an installed pi package and exercises its
+real loader and subprocess executor with deterministic HTTP fixtures:
+
+```bash
+PI_CODING_AGENT_DIR=/path/to/node_modules/@mariozechner/pi-coding-agent \
+  node tests/test_extension.mjs
+```
+
+Set `PI_TEST_PROCESS_TIMEOUT=1` to include the 25-second subprocess timeout check.
+The fixtures make no model or external HTTP requests.
 
 ## License
 

@@ -4,7 +4,7 @@ Web research helper for pi-mini-web-research.
 Python3 stdlib only — no pip packages required.
 
 Commands:
-    search <query>   Search DuckDuckGo Lite, return JSON results
+    search <query>   Search the configured provider, return JSON results
     fetch  <url>     Fetch URL, strip HTML, return cleaned text as JSON
 """
 
@@ -15,6 +15,7 @@ import re
 import socket
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,6 +30,12 @@ TIMEOUT = 20
 MAX_DOWNLOAD = 1024 * 1024  # 1 MB
 
 ALLOWLIST_ENV = "PI_WEB_RESEARCH_ALLOWLIST"
+SEARCH_PROVIDER_ENV = "PI_WEB_RESEARCH_SEARCH_PROVIDER"
+PARALLEL_MCP_URL = "https://search.parallel.ai/mcp"
+PROJECT_USER_AGENT = (
+    "pi-mini-web-research/1.0.0 "
+    "(+https://github.com/pablomarti/pi-mini-web-research)"
+)
 
 BLOCKED_HOSTNAMES = {
     "localhost",
@@ -338,7 +345,142 @@ class _DDGParser(HTMLParser):
 # ---------------------------------------------------------------------------
 
 
-def cmd_search(query: str):
+def _mcp_response(resp, request_id):
+    """Read one bounded JSON-RPC response, including Streamable HTTP SSE."""
+    if "text/event-stream" in resp.headers.get("Content-Type", "").lower():
+        size = 0
+        data = []
+        while True:
+            line = resp.readline(MAX_DOWNLOAD + 1)
+            size += len(line)
+            if size > MAX_DOWNLOAD:
+                raise ValueError("Parallel response exceeds 1 MB")
+            if not line or not line.strip():
+                if data:
+                    message = json.loads("\n".join(data))
+                    if isinstance(message, dict) and message.get("id") == request_id:
+                        return message
+                data = []
+                if not line:
+                    raise ValueError("Parallel stream ended without a response")
+            elif line.startswith(b"data:"):
+                data.append(line[5:].decode("utf-8").lstrip(" ").rstrip("\r\n"))
+    raw = resp.read(MAX_DOWNLOAD + 1)
+    if len(raw) > MAX_DOWNLOAD:
+        raise ValueError("Parallel response exceeds 1 MB")
+    return json.loads(raw)
+
+
+class _ParallelRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("Parallel MCP redirects are not allowed")
+
+
+def _parallel_request(payload, headers, timeout):
+    # The destination is fixed, not an untrusted URL. Refuse all redirects so
+    # MCP session headers can never be forwarded to another service.
+    request = urllib.request.Request(
+        PARALLEL_MCP_URL, data=json.dumps(payload).encode("utf-8"),
+        headers=headers, method="POST",
+    )
+    opener = urllib.request.build_opener(
+        _ParallelRedirectHandler(), urllib.request.HTTPSHandler(context=_ssl_context())
+    )
+    opener.addheaders = []
+    return opener.open(request, timeout=timeout)
+
+
+def _parallel_search(query: str, session_id=None):
+    """Use anonymous Parallel Search MCP with a single overall time budget."""
+    deadline = time.monotonic() + TIMEOUT
+    headers = {
+        "User-Agent": PROJECT_USER_AGENT,
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+
+    def rpc(method, params=None, request_id=None):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Parallel search timed out")
+        payload = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            payload["params"] = params
+        if request_id is not None:
+            payload["id"] = request_id
+        with _parallel_request(payload, headers, remaining) as resp:
+            if method == "initialize":
+                session = resp.headers.get("Mcp-Session-Id")
+                if session:
+                    headers["Mcp-Session-Id"] = session
+            if request_id is None:
+                return None
+            message = _mcp_response(resp, request_id)
+        if not isinstance(message, dict) or message.get("id") != request_id:
+            raise ValueError("Invalid Parallel JSON-RPC response")
+        if "error" in message:
+            raise ValueError(f"Parallel MCP error: {message['error']}")
+        if not isinstance(message.get("result"), dict):
+            raise ValueError("Missing Parallel MCP result")
+        return message["result"]
+
+    initialized = rpc("initialize", {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "pi-mini-web-research", "version": "1.0.0"},
+    }, 1)
+    version = initialized.get("protocolVersion")
+    if version != "2025-03-26":
+        raise ValueError(f"Unsupported Parallel MCP protocol: {version}")
+    headers["MCP-Protocol-Version"] = version
+    rpc("notifications/initialized")
+    arguments = {"objective": query, "search_queries": [query]}
+    if session_id:
+        arguments["session_id"] = session_id
+    result = rpc("tools/call", {"name": "web_search", "arguments": arguments}, 2)
+    if result.get("isError"):
+        text = " ".join(c.get("text", "") for c in result.get("content", [])
+                        if c.get("type") == "text")
+        raise ValueError(f"Parallel search failed: {text[:1000]}")
+    structured = result.get("structuredContent")
+    if structured is None:
+        text = "\n".join(c.get("text", "") for c in result.get("content", [])
+                         if c.get("type") == "text")
+        structured = json.loads(text)
+    if not isinstance(structured, dict) or not isinstance(structured.get("results"), list):
+        raise ValueError("Invalid Parallel search results")
+    results = []
+    for item in structured["results"][:20]:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid Parallel search result")
+        url = item.get("url", "")
+        parsed_url = urllib.parse.urlparse(url) if isinstance(url, str) else None
+        if (not parsed_url or parsed_url.scheme not in ("http", "https")
+                or not parsed_url.hostname or parsed_url.username or parsed_url.password):
+            raise ValueError("Invalid Parallel result URL")
+        title = item.get("title") or url
+        excerpts = item.get("excerpts", [])
+        if not isinstance(title, str) or not isinstance(excerpts, list) or not all(isinstance(e, str) for e in excerpts):
+            raise ValueError("Invalid Parallel search excerpt")
+        results.append({"title": title[:500], "url": url[:2000],
+                        "snippet": "\n".join(excerpts)[:3000]})
+    return results
+
+
+def cmd_search(query: str, session_id=None):
+    """Resolve an explicit provider, preserving the keyless DuckDuckGo default."""
+    provider = os.environ.get(SEARCH_PROVIDER_ENV, "duckduckgo").strip().lower()
+    if provider == "none":
+        raise ValueError(f"Web search is disabled by {SEARCH_PROVIDER_ENV}=none")
+    if provider == "parallel":
+        json.dump({"results": _parallel_search(query, session_id), "provider": provider},
+                  sys.stdout, ensure_ascii=False)
+        return
+    if provider != "duckduckgo":
+        raise ValueError(f"Unknown {SEARCH_PROVIDER_ENV}: {provider!r}; use duckduckgo, parallel, or none")
+    _search_duckduckgo(query)
+
+
+def _search_duckduckgo(query: str):
     """Search DuckDuckGo Lite and print JSON results."""
     body = urllib.parse.urlencode({"q": query}).encode()
     resp = _request(
@@ -425,11 +567,13 @@ if __name__ == "__main__":
 
     cmd = sys.argv[1]
     try:
-        if cmd == "search":
-            if len(sys.argv) < 3:
+        if cmd in ("search", "search-session"):
+            query_start = 3 if cmd == "search-session" else 2
+            if len(sys.argv) <= query_start:
                 json.dump({"error": "Missing search query"}, sys.stdout)
                 sys.exit(1)
-            cmd_search(" ".join(sys.argv[2:]))
+            session_id = sys.argv[2] if cmd == "search-session" else None
+            cmd_search(" ".join(sys.argv[query_start:]), session_id)
         elif cmd == "fetch":
             if len(sys.argv) < 3:
                 json.dump({"error": "Missing URL"}, sys.stdout)
